@@ -1,11 +1,15 @@
 import os
 import sys
 import time
+import pickle as pk
+import pyperclip
+
 import serial
 import serial.tools.list_ports
+
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QTextEdit, QLineEdit, QComboBox, QFileDialog, QLabel,
-                             QMessageBox)
+                             QMessageBox,QMenu)
 from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, QSettings, Qt
 from PyQt6.QtGui import QTextCharFormat, QColor, QIcon
 
@@ -16,6 +20,40 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
 
     return os.path.join(base_path, relative_path)
+
+class Cache(dict):
+    _filename = 'cache.pk'
+
+    def __init__(self):
+        super().__init__()
+        if os.path.isfile(self._filename):
+            try:
+                with open(self._filename, 'rb') as f:
+                    self.update(pk.load(f))
+            except:
+                pass
+
+    def _save(self):
+        with open(self._filename, 'wb') as f:
+            pk.dump(dict(self), f)
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._save()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self._save()
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default  # triggers __setitem__
+        return self[key]
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self._save()
+
 
 class SerialReaderThread(QThread):
     data_received = pyqtSignal(str)
@@ -101,15 +139,36 @@ class ScriptExecutionThread(QThread):
     def log(self,*args, sep=' ', end='\n', color="yellow"):
         self.log_request.emit(sep.join(map(str, args)) + end,color)
 
+class MyTextEdit(QTextEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+
+        clear_action = menu.addAction("Clear")
+        copy_action = menu.addAction("Copy")
+
+        action = menu.exec(event.globalPos())
+
+        if action == copy_action:
+            pyperclip.copy(self.toPlainText())
+        elif action == clear_action:
+            self.clear()
+
 class SerialMonitorApp(QWidget):
     def __init__(self):
         super().__init__()
+        self.cache = Cache()
         self.serial_conn = None
         self.receive_thread = None
         self.selected_file = ''
-        self.command_history = []
-        self.history_index = 0
-        self.command_history_changes = {}
+        if 'command_history' in self.cache:
+            self.command_history,self.command_history_changes,self.history_index = self.cache['command_history']
+        else:
+            self.command_history,self.command_history_changes,self.history_index = [],{},0
         self.init_ui()
         self.refresh_com_ports()
 
@@ -138,11 +197,17 @@ class SerialMonitorApp(QWidget):
         config_layout.addWidget(self.connect_button)
         config_layout.addWidget(self.connection_status_indicator)
 
+        # Load from cache if available
+        if 'baud_rate' in self.cache:
+            self.baud_rate_combo.setCurrentText(self.cache['baud_rate'])
+
+        # Save to cache on change
+        self.com_port_combo.currentTextChanged.connect(lambda text: self.cache.__setitem__('com_port', text))
+        self.baud_rate_combo.currentTextChanged.connect(lambda text: self.cache.__setitem__('baud_rate', text))
         
         layout.addLayout(config_layout)
 
-        self.textbox = QTextEdit()
-        self.textbox.setReadOnly(True)
+        self.textbox = MyTextEdit()
         layout.addWidget(self.textbox)
 
         command_layout = QHBoxLayout()
@@ -171,14 +236,19 @@ class SerialMonitorApp(QWidget):
         self.setLayout(layout)
 
     def refresh_com_ports(self):
+        bkp = None
+        if 'com_port' in self.cache:
+            bkp = self.cache['com_port']
         self.com_port_combo.clear()
-        ports = serial.tools.list_ports.comports()
-        self.com_port_combo.addItems([port.device for port in ports])
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        self.com_port_combo.addItems(ports)
+        if bkp in ports:
+            self.com_port_combo.setCurrentText(bkp)
 
     def toggle_serial_connection(self):
         if self.serial_conn and self.serial_conn.is_open:
 
-            if self.receive_thread:
+            if not self.receive_thread == None:
                 self.receive_thread.stop()
                 self.receive_thread.wait()
                 self.receive_thread = None
@@ -186,6 +256,7 @@ class SerialMonitorApp(QWidget):
             self.connection_status_indicator.setStyleSheet("background-color: red; width: 20px; height: 20px;")
             self.connection_status_indicator.setText("  Disconnected  ")
             self.connect_button.setText("Connect")
+            self.refresh_button.setVisible(True)
 
             self.com_port_combo.setEnabled(True)
             self.baud_rate_combo.setEnabled(True)
@@ -203,6 +274,7 @@ class SerialMonitorApp(QWidget):
                     self.connection_status_indicator.setStyleSheet("background-color: green; width: 20px; height: 20px;")
                     self.connection_status_indicator.setText("  Connected  ")
                     self.connect_button.setText("Diconnect")
+                    self.refresh_button.setVisible(False)
 
                     self.com_port_combo.setEnabled(False)
                     self.baud_rate_combo.setEnabled(False)
@@ -253,17 +325,23 @@ class SerialMonitorApp(QWidget):
         error_dialog.exec()
 
     def select_script(self):
-        file_dialog = QFileDialog(self)
+        start_dir = ""
+        cached_dir = self.cache.get("last_script_dir")
+        if cached_dir and os.path.isdir(cached_dir):
+            start_dir = cached_dir
+
+        file_dialog = QFileDialog(self, directory=start_dir)
         file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+
         if file_dialog.exec():
             selected_file = file_dialog.selectedFiles()[0]
             if selected_file:
                 self.script_label.setText(selected_file)
                 self.selected_file = selected_file
+                self.cache.__setitem__('last_script_dir', os.path.dirname(selected_file))
 
     def run_selected_script(self):
         if self.selected_file:
-            self.textbox.clear()
             self.script_thread = ScriptExecutionThread(self.serial_conn, self.selected_file)
             self.script_thread.error_occurred.connect(self.show_error_popup)
             self.script_thread.log_request.connect(self.log_textbox)
@@ -276,17 +354,19 @@ class SerialMonitorApp(QWidget):
         command = self.command_input.text()
         self.command_input.clear()
         if command:
-            if (self.serial_conn and self.serial_conn.is_open) or True:
+            if (self.serial_conn and self.serial_conn.is_open):
                 # self.textbox.clear()
-                # self.serial_conn.write(command.encode())
+                self.serial_conn.write(command.encode())
 
                 if not self.command_history or self.command_history[-1] != command:
                     self.command_history.append(command)
                 self.history_index = len(self.command_history)
                 self.command_history_changes.clear()
                 self.command_history_changes[self.history_index] = ''
+                self.cache.__setitem__('command_history', (self.command_history,self.command_history_changes,self.history_index))
             else:
                 self.show_error_popup("Serial port not open.")
+
 
     def eventFilter(self, obj, event):
         if obj == self.command_input and event.type() == event.Type.KeyPress:
@@ -316,6 +396,7 @@ class SerialMonitorApp(QWidget):
                 return True
 
 
+        self.cache.__setitem__('command_history', (self.command_history,self.command_history_changes,self.history_index))
         return super().eventFilter(obj, event)
 
     def closeEvent(self, event):
