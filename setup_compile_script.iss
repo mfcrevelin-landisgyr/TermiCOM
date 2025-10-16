@@ -1,7 +1,7 @@
-#define MyAppName "TermiCOM"
+#define MyAppName "WolfWire"
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "Landis+Gyr, Inc."
-#define MyAppExeName "TermiCOM.exe"
+#define MyAppExeName "WolfWire.exe"
 #define MyAppAuthor "Mateus Felipe Crevelin"
 
 [Setup]
@@ -16,7 +16,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
 ; LicenseFile=..\LICENSE.txt
 ; Uncomment the following line to run in non administrative install mode (install for current user only.)
-;PrivilegesRequired=lowest
+PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputBaseFilename={#MyAppName}_{#MyAppVersion}_windows_setup
 SetupIconFile=.\Windows setup.ico

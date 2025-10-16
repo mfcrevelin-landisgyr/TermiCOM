@@ -1,416 +1,527 @@
-import os
-import sys
-import time
-import pickle as pk
+# -*- coding: utf-8 -*-
+import serial, serial.tools.list_ports
 import pyperclip
+import time
+import json
+import sys
+import re
+import os
 
-import serial
-import serial.tools.list_ports
+from platformdirs import user_data_dir
+from datetime import datetime
 
-from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QTextEdit, QLineEdit, QComboBox, QFileDialog, QLabel,
-                             QMessageBox,QMenu)
-from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, QSettings, Qt
-from PyQt6.QtGui import QTextCharFormat, QColor, QIcon
+from PyQt6.QtGui import QTextCharFormat, QColor, QFont, QTextCursor, QTextDocument
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QMutex
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QMenu,
+    QPushButton, QTextEdit, QComboBox, QLabel, QMessageBox
+)
 
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS2
-    except Exception:
-        base_path = os.path.abspath(".")
+# -------------------------------------------------
+# Serial forwarding worker with time/baud-aware buffering
+# -------------------------------------------------
+class SerialForwarderThread(QThread):
+    log_signal = pyqtSignal(str, str)  # (text, color)
 
-    return os.path.join(base_path, relative_path)
-
-class Cache(dict):
-    _filename = 'cache.pk'
-
-    def __init__(self):
+    def __init__(self, source_conn, dest_conn, direction, baud, ui_log_mutex: QMutex,
+                 gap_chars: int = 3, bits_per_char: int = 10):
+        """
+        direction: 'AtoB' or 'BtoA'
+        baud: integer bps
+        gap_chars: how many char-times of silence to consider a frame finished
+        bits_per_char: 8N1 => 10 bits typical; adjust if your line config differs
+        """
         super().__init__()
-        if os.path.isfile(self._filename):
-            try:
-                with open(self._filename, 'rb') as f:
-                    self.update(pk.load(f))
-            except:
-                pass
-
-    def _save(self):
-        with open(self._filename, 'wb') as f:
-            pk.dump(dict(self), f)
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        self._save()
-
-    def __delitem__(self, key):
-        super().__delitem__(key)
-        self._save()
-
-    def setdefault(self, key, default=None):
-        if key not in self:
-            self[key] = default  # triggers __setitem__
-        return self[key]
-
-    def update(self, *args, **kwargs):
-        super().update(*args, **kwargs)
-        self._save()
-
-
-class SerialReaderThread(QThread):
-    data_received = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self,connection):
-        super().__init__()
-        self.connection = connection
+        self.source_conn = source_conn
+        self.dest_conn = dest_conn
+        self.direction = direction
         self.running = False
-        self.buffer = ""
-        self.last_data_time = - float('inf')
-        self.timeout = 0.05
+
+        # Timing / buffering
+        self.baud = max(int(baud), 300)
+        self.bits_per_char = max(int(bits_per_char), 9)  # conservative minimum
+        self.char_time_ns = int(1e9 * self.bits_per_char / self.baud)
+        self.flush_gap_ns = max(self.char_time_ns * max(gap_chars, 1), 100_000)  # ≥ 0.1 ms
+        self.poll_interval_s = max(self.char_time_ns / 2 / 1e9, 0.0005)
+
+        self.msg_buffer = bytearray()
+        self.msg_start_ns = 0
+        self.last_rx_ns = 0
+
+        # Optional shared mutex to avoid simultaneous emits from both threads
+        self.ui_log_mutex = ui_log_mutex
+
+    def _flush_frame_if_due(self, now_ns: int):
+        """Flush buffered frame if idle gap elapsed."""
+        if not self.msg_buffer:
+            return
+        if (now_ns - self.last_rx_ns) >= self.flush_gap_ns*1.5:
+            # Build one consolidated log entry
+            hex_data = ' '.join(f'{b:02X}' for b in self.msg_buffer)
+            atob = self.direction == 'AtoB'
+            tag = '[A->B]' if atob else '[A<-B]'
+            color = "#f44250" if atob else "#4285f4"
+            timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+            prefix = f"{tag} {timestamp} : "
+
+            # Ensure atomic emit wrt the other thread
+            if self.ui_log_mutex is not None:
+                self.ui_log_mutex.lock()
+            try:
+                self.log_signal.emit(f"{prefix}{hex_data}\n", color)
+            finally:
+                if self.ui_log_mutex is not None:
+                    self.ui_log_mutex.unlock()
+
+            self.msg_buffer.clear()
+            self.msg_start_ns = 0
+            self.last_rx_ns = 0
+
+    def _append_rx(self, data: bytes, now_ns: int):
+        """Append received bytes into buffer and forward to dest."""
+        if not data:
+            return
+        # Start-of-frame timestamp
+        if not self.msg_buffer:
+            self.msg_start_ns = now_ns
+        self.msg_buffer.extend(data)
+        self.last_rx_ns = now_ns
+
+        # Forward to the destination port
+        try:
+            self.dest_conn.write(data)
+        except Exception as e:
+            # Log once; keep going
+            if self.ui_log_mutex is not None:
+                self.ui_log_mutex.lock()
+            try:
+                self.log_signal.emit(f"[ERROR] write({self.direction}) -> {e}\n", "red")
+            finally:
+                if self.ui_log_mutex is not None:
+                    self.ui_log_mutex.unlock()
 
     def run(self):
+        self.running = True
+        while self.running:
+            try:
+                # Pull whatever is currently waiting
+                in_wait = self.source_conn.in_waiting
+                if in_wait:
+                    data = self.source_conn.read(in_wait)
+                    now_ns = time.time_ns()
+                    if data:
+                        self._append_rx(data, now_ns)
+                else:
+                    # No new data -> check if a frame is ready to flush
+                    self._flush_frame_if_due(time.time_ns())
+
+                # Small poll sleep tuned by baud rate
+                time.sleep(self.poll_interval_s)
+
+            except Exception as e:
+                # Emit error (rare) and keep trying
+                if self.ui_log_mutex is not None:
+                    self.ui_log_mutex.lock()
+                try:
+                    self.log_signal.emit(f"[ERROR] Forwarding error ({self.direction}): {e}\n", "red")
+                finally:
+                    if self.ui_log_mutex is not None:
+                        self.ui_log_mutex.unlock()
+                time.sleep(0.2)
+
+        # Thread is stopping: flush any remaining buffered frame
         try:
-            self.running = True
-            while self.running:
-                if self.connection and self.connection.in_waiting:
-                    byte_data = self.connection.read(self.connection.in_waiting)
-                    self.handle_incoming_data(byte_data)
-
-                if self.buffer and (time.time() - self.last_data_time) >= self.timeout:
-                    self.flush_buffer()
-
-                time.sleep(0.01)
-        except serial.SerialException as e:
-            self.error_occurred.emit(f"Error reading serial port:\n\n{e}\n")
-
-    def handle_incoming_data(self, byte_data):
-        decoded_data = self.decode_serial_data(byte_data)
-        self.buffer += decoded_data
-
-        if self.buffer.endswith('\n'):
-            self.flush_buffer()
-        else:
-            self.last_data_time = time.time()
-
-    def flush_buffer(self):
-        if self.buffer:
-            self.data_received.emit(self.buffer)
-            self.buffer = ""
-
-    def decode_serial_data(self, data):
-        output = []
-        for byte in data:
-            if 32 <= byte <= 126 or byte in [9,10,13]:
-                output.append(chr(byte))
-            else:
-                output.append(f"<{byte}>")
-        return ''.join(output)
+            self._flush_frame_if_due(time.time_ns() + self.flush_gap_ns + 1)
+        except Exception:
+            pass
 
     def stop(self):
         self.running = False
 
-class ScriptExecutionThread(QThread):
-    error_occurred = pyqtSignal(str)
-    log_request = pyqtSignal(str,str)
 
-    def __init__(self, connection, script_path):
-        super().__init__()
-        self.connection = connection
-        try:
-            with open(script_path, "r") as file:
-                self.script_content = file.read()
-        except Exception as e:
-            self.script_content = ''
-            self.error_occurred.emit(f"Error reading script file:\n\n{e}\n")
-
-    def run(self):
-        if self.script_content and self.connection and self.connection.is_open:
-            try:
-                local_env = {'SERIAL': self.com_send, "print": self.log}
-                exec(self.script_content, local_env)
-            except Exception as e:
-                self.error_occurred.emit(f"Error executing script file:\n\n{e}\n")
-        else:
-            self.error_occurred.emit("Serial port not open.")
-
-    def com_send(self, data):
-        if self.connection and self.connection.is_open:
-            self.connection.write(data.encode())
-
-    def log(self,*args, sep=' ', end='\n', color="yellow"):
-        self.log_request.emit(sep.join(map(str, args)) + end,color)
-
-class MyTextEdit(QTextEdit):
+# -------------------------------------------------
+# Read-only text box with copy/clear context menu
+# -------------------------------------------------
+class CTextEdit(QTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Read-only, but allow selection by mouse/keyboard
         self.setReadOnly(True)
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+
+        # --- highlight state ---
+        self._active_selection = ""
+        self._hl_format = QTextCharFormat()
+        # Soft yellow highlight; tweak to taste
+        self._hl_format.setBackground(QColor('#fff59d'))
+
+        # Re-run highlights when the user changes selection or text changes
+        self.selectionChanged.connect(self._on_selection_changed)
+        self.document().contentsChange.connect(self._on_contents_change)
+
+    # ----- context menu (unchanged items + improved copy) -----
     def contextMenuEvent(self, event):
         menu = QMenu(self)
 
         clear_action = menu.addAction("Clear")
-        copy_action = menu.addAction("Copy")
+        flag_action  = menu.addAction("Flag")
+        copy_action  = menu.addAction("Copy")
 
         action = menu.exec(event.globalPos())
 
         if action == copy_action:
-            pyperclip.copy(self.toPlainText())
+            # Copy selection if present; otherwise copy entire text
+            txt = self.textCursor().selectedText() or self.toPlainText()
+            # Normalize paragraph separator to newline for clipboard
+            pyperclip.copy(txt.replace('\u2029', '\n'))
+
+        if action == flag_action:
+            cursor = self.textCursor()
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor('#fcfc4b'))
+            # fmt.setFontWeight(QFont.Weight.Bold)
+            cursor.setCharFormat(fmt)
+            cursor.insertText('◉\n')
+            self.setTextCursor(cursor)
+
         elif action == clear_action:
             self.clear()
 
-class SerialMonitorApp(QWidget):
+    # ----- keyboard shortcuts -----
+    def keyPressEvent(self, event):
+        # Ctrl+W to clear
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_W:
+            self.clear()
+        else:
+            super().keyPressEvent(event)
+
+    # ----- selection/highlight logic -----
+    def _on_selection_changed(self):
+        sel = self.textCursor().selectedText()
+        # Normalize newlines from selection (QTextEdit uses U+2029 in selections)
+        if sel:
+            sel = sel.replace('\u2029', '\n')
+        # Ignore empty/whitespace-only selections
+        self._active_selection = sel if (sel and sel.strip()) else ""
+        self._apply_highlights()
+
+    def _on_contents_change(self, *_):
+        # If a pattern is active, re-apply highlights when text changes
+        if self._active_selection:
+            self._apply_highlights()
+
+    def _apply_highlights(self):
+        if not self._active_selection:
+            self.setExtraSelections([])
+            return
+
+        doc = self.document()
+        cur = QTextCursor(doc)
+        extras = []
+
+        # Case-sensitive search (matches exactly what the user selected)
+        find_flags = QTextDocument.FindFlag.FindCaseSensitively
+
+        while True:
+            cur = doc.find(self._active_selection, cur, find_flags)
+            if cur.isNull():
+                break
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = cur
+            sel.format = self._hl_format
+            extras.append(sel)
+
+        self.setExtraSelections(extras)
+
+    def reapply_highlight(self):
+        """Helper to re-apply current highlight after programmatic edits."""
+        if self._active_selection:
+            self._apply_highlights()
+        else:
+            self.setExtraSelections([])
+
+
+
+
+# -------------------------------------------------
+# Main Application
+# -------------------------------------------------
+class SerialMiddlemanApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.cache = Cache()
-        self.serial_conn = None
-        self.receive_thread = None
-        self.selected_file = ''
-        if 'command_history' in self.cache:
-            self.command_history,self.command_history_changes,self.history_index = self.cache['command_history']
-        else:
-            self.command_history,self.command_history_changes,self.history_index = [],{},0
+        self.setWindowTitle("WolfWire - COM Port Middleman")
+        self.CACHE_FILE = os.path.join(user_data_dir("WolfWire", "WolfWire"), "com_cache.json")
+
+        self.serial_A = None
+        self.serial_B = None
+        self.thread_AtoB = None
+        self.thread_BtoA = None
+
+        # guard to avoid recursive updates when filtering combos
+        self._updating_combos = False
+
+        # Shared UI log mutex (prevents simultaneous emit from both threads)
+        self.log_mutex = QMutex()
+
         self.init_ui()
         self.refresh_com_ports()
 
+        self._restore_cached_selection()
+
+    # ---------- Cache ----------
+    def _restore_cached_selection(self):
+        try:
+            with open(self.CACHE_FILE, "r", encoding="utf-8") as f:
+                self.cached_ports = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.cached_ports = {}
+
+        if not self.cached_ports:
+            return
+
+        ports = self._list_active_ports()
+        rates = [self.baud_rate_combo.itemText(i) for i in range(self.baud_rate_combo.count())]
+
+        portA = self.cached_ports.get("portA")
+        portB = self.cached_ports.get("portB")
+        baud  = self.cached_ports.get("baud")
+
+        if portA in ports:
+            self.com_port_combo_A.setCurrentText(portA)
+        if portB in ports:
+            self.com_port_combo_B.setCurrentText(portB)
+        if baud in rates:
+            self.baud_rate_combo.setCurrentText(baud)
+
+    def _save_cached_ports(self):
+        os.makedirs(os.path.dirname(self.CACHE_FILE), exist_ok=True)
+        data = {
+            "portA": self.com_port_combo_A.currentText(),
+            "portB": self.com_port_combo_B.currentText(),
+            "baud": self.baud_rate_combo.currentText()
+        }
+        with open(self.CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    # ---------- UI ----------
     def init_ui(self):
-
-        self.setWindowTitle("TermiCOM")
-        self.setWindowIcon(QIcon(resource_path("assets\\icon.png")))
-
         layout = QVBoxLayout()
-
         config_layout = QHBoxLayout()
-        self.com_port_combo = QComboBox()
-        self.baud_rate_combo = QComboBox()
-        self.baud_rate_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
+
         self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_com_ports)
+
+        self.com_port_combo_A = QComboBox()
+        self.com_port_combo_B = QComboBox()
+        self.com_port_combo_A.currentTextChanged.connect(self._on_portA_selected)
+        self.com_port_combo_B.currentTextChanged.connect(self._on_portB_selected)
+
+        self.baud_rate_combo = QComboBox()
+        self.baud_rate_combo.addItems([
+                "300", "600", "1200", "2400", "4800", "9600", "14400", 
+                "19200", "28800", "38400", "57600", "115200", "128000", "256000"
+            ])
+        self.baud_rate_combo.setCurrentText("115200")
+        self.baud_rate_combo.currentTextChanged.connect(self._on_baud_selected)
+
         config_layout.addWidget(self.refresh_button)
-        config_layout.addWidget(QLabel("COM Port:"))
-        config_layout.addWidget(self.com_port_combo)
+        config_layout.addWidget(QLabel("COM Port A:"))
+        config_layout.addWidget(self.com_port_combo_A)
+        config_layout.addWidget(QLabel("COM Port B:"))
+        config_layout.addWidget(self.com_port_combo_B)
         config_layout.addWidget(QLabel("Baud Rate:"))
         config_layout.addWidget(self.baud_rate_combo)
         config_layout.addStretch()
+
         self.connect_button = QPushButton("Connect")
-        self.connect_button.clicked.connect(self.toggle_serial_connection)
-        self.connection_status_indicator = QLabel("  Disconnected  ")
-        self.connection_status_indicator.setStyleSheet("background-color: red; width: 20px; height: 20px;")
+        self.connect_button.clicked.connect(self.toggle_connection)
+
+        self.status_label = QLabel("Disconnected")
+        self.status_label.setStyleSheet("background-color: red;")
         config_layout.addWidget(self.connect_button)
-        config_layout.addWidget(self.connection_status_indicator)
+        config_layout.addWidget(self.status_label)
 
-        # Load from cache if available
-        if 'baud_rate' in self.cache:
-            self.baud_rate_combo.setCurrentText(self.cache['baud_rate'])
-
-        # Save to cache on change
-        self.com_port_combo.currentTextChanged.connect(lambda text: self.cache.__setitem__('com_port', text))
-        self.baud_rate_combo.currentTextChanged.connect(lambda text: self.cache.__setitem__('baud_rate', text))
-        
         layout.addLayout(config_layout)
 
-        self.textbox = MyTextEdit()
+        self.textbox = CTextEdit()
         layout.addWidget(self.textbox)
-
-        command_layout = QHBoxLayout()
-        self.command_input = QLineEdit()
-        self.command_input.setPlaceholderText("Type command here...")
-        self.command_input.returnPressed.connect(self.send_manual_command)
-        self.command_input.installEventFilter(self)
-        self.send_button = QPushButton("Send")
-        self.send_button.clicked.connect(self.send_manual_command)
-        command_layout.addWidget(self.command_input)
-        command_layout.addWidget(self.send_button)
-        layout.addLayout(command_layout)
-
-        script_layout = QHBoxLayout()
-        self.script_label = QLabel("No script selected.")
-        self.script_button = QPushButton("Select Script")
-        self.script_button.clicked.connect(self.select_script)
-        self.run_button = QPushButton("Run Script")
-        self.run_button.clicked.connect(self.run_selected_script)
-        script_layout.addWidget(self.script_label)
-        script_layout.addStretch()
-        script_layout.addWidget(self.script_button)
-        script_layout.addWidget(self.run_button)
-        layout.addLayout(script_layout)
 
         self.setLayout(layout)
 
+    # ---------- Port listing & filtering ----------
+    def _list_active_ports(self):
+        """Return list of strings like ['COM3', 'COM4', ...] on Windows or '/dev/tty...' on *nix."""
+        return [port.device for port in serial.tools.list_ports.comports()]
+
+    def _fill_combo(self, combo: QComboBox, items, keep_selection=None):
+        """Fill combo with items, optionally keeping previous selection if still present."""
+        combo.blockSignals(True)
+        current = keep_selection if keep_selection is not None else combo.currentText()
+        combo.clear()
+        combo.addItems(items)
+        if current and current in items:
+            combo.setCurrentText(current)
+        combo.blockSignals(False)
+
     def refresh_com_ports(self):
-        bkp = None
-        if 'com_port' in self.cache:
-            bkp = self.cache['com_port']
-        self.com_port_combo.clear()
-        ports = [port.device for port in serial.tools.list_ports.comports()]
-        self.com_port_combo.addItems(ports)
-        if bkp in ports:
-            self.com_port_combo.setCurrentText(bkp)
+        """
+        Refresh both combos with active ports and keep them mutually exclusive.
+        """
+        if self._updating_combos:
+            return
+        self._updating_combos = True
 
-    def toggle_serial_connection(self):
-        if self.serial_conn and self.serial_conn.is_open:
+        ports = self._list_active_ports()
 
-            if not self.receive_thread == None:
-                self.receive_thread.stop()
-                self.receive_thread.wait()
-                self.receive_thread = None
-            self.serial_conn.close()
-            self.connection_status_indicator.setStyleSheet("background-color: red; width: 20px; height: 20px;")
-            self.connection_status_indicator.setText("  Disconnected  ")
-            self.connect_button.setText("Connect")
-            self.refresh_button.setVisible(True)
+        # Remember current selections to try to preserve them
+        selA = self.com_port_combo_A.currentText()
+        selB = self.com_port_combo_B.currentText()
 
-            self.com_port_combo.setEnabled(True)
-            self.baud_rate_combo.setEnabled(True)
+        # First, fill both with the full list
+        self._fill_combo(self.com_port_combo_A, ports, keep_selection=selA)
+        self._fill_combo(self.com_port_combo_B, ports, keep_selection=selB)
 
+        # Disable Connect if less than 2 ports are available
+        self.connect_button.setEnabled(len(ports) >= 2)
+
+        self._updating_combos = False
+
+    def _on_portA_selected(self, text):
+        self._save_cached_ports()
+
+    def _on_portB_selected(self, text):
+        self._save_cached_ports()
+
+
+    def _on_baud_selected(self, text):
+        self._save_cached_ports()
+
+    # ---------- Connect / Disconnect ----------
+    def toggle_connection(self):
+        if self.serial_A and self.serial_A.is_open:
+            self.disconnect_ports()
         else:
+            self.connect_ports()
 
-            port = self.com_port_combo.currentText()
-            baud_rate = self.baud_rate_combo.currentText()
+    def connect_ports(self):
+        ports = self._list_active_ports()
+        if len(ports) < 2:
+            self.show_error("Not enough active COM ports detected (need at least 2).")
+            return
 
+        portA = self.com_port_combo_A.currentText()
+        portB = self.com_port_combo_B.currentText()
+        if not portA or not portB:
+            self.show_error("Please select both COM Port A and COM Port B.")
+            return
+        if portA == portB:
+            self.show_error("COM Port A and COM Port B must be different.")
+            return
+
+        baud_rate = int(self.baud_rate_combo.currentText())
+
+        # Open ports
+        try:
+            self.serial_A = serial.Serial(portA, baud_rate, timeout=1)
+            self.serial_B = serial.Serial(portB, baud_rate, timeout=1)
+        except serial.SerialException as e:
+            self.show_error(f"Error opening ports:\n{e}")
+            # Cleanup if one opened successfully
             try:
-                self.serial_conn = serial.Serial(port, int(baud_rate), timeout=1)
+                if self.serial_A and self.serial_A.is_open:
+                    self.serial_A.close()
+            except Exception:
+                pass
+            try:
+                if self.serial_B and self.serial_B.is_open:
+                    self.serial_B.close()
+            except Exception:
+                pass
+            self.serial_A = None
+            self.serial_B = None
+            return
 
-                if self.serial_conn.is_open:
+        # Start forwarders (with buffering)
+        # bits_per_char: 10 for 8N1; adjust if you later expose parity/stop settings
+        self.thread_AtoB = SerialForwarderThread(self.serial_A, self.serial_B, "AtoB",
+                                                 baud_rate, self.log_mutex,
+                                                 gap_chars=3, bits_per_char=10)
+        self.thread_BtoA = SerialForwarderThread(self.serial_B, self.serial_A, "BtoA",
+                                                 baud_rate, self.log_mutex,
+                                                 gap_chars=3, bits_per_char=10)
 
-                    self.connection_status_indicator.setStyleSheet("background-color: green; width: 20px; height: 20px;")
-                    self.connection_status_indicator.setText("  Connected  ")
-                    self.connect_button.setText("Diconnect")
-                    self.refresh_button.setVisible(False)
+        self.thread_AtoB.log_signal.connect(self.log_text)
+        self.thread_BtoA.log_signal.connect(self.log_text)
+        self.thread_AtoB.start()
+        self.thread_BtoA.start()
 
-                    self.com_port_combo.setEnabled(False)
-                    self.baud_rate_combo.setEnabled(False)
+        # UI state
+        self.status_label.setText("Connected")
+        self.status_label.setStyleSheet("background-color: green;")
+        self.connect_button.setText("Disconnect")
+        self.com_port_combo_A.setEnabled(False)
+        self.com_port_combo_B.setEnabled(False)
+        self.baud_rate_combo.setEnabled(False)
+        self.refresh_button.setEnabled(False)
+        self.log_text(f"[INFO] Bridging {portA} <=> {portB} @ {baud_rate} bps\n", "green")
 
-                    self.receive_thread = SerialReaderThread(self.serial_conn)
-                    self.receive_thread.data_received.connect(self.update_textbox)
-                    self.receive_thread.error_occurred.connect(self.show_error_popup)
-                    self.receive_thread.start()
+    def disconnect_ports(self):
+        # Stop threads
+        if self.thread_AtoB:
+            self.thread_AtoB.stop()
+            self.thread_AtoB.wait()
+            self.thread_AtoB = None
+        if self.thread_BtoA:
+            self.thread_BtoA.stop()
+            self.thread_BtoA.wait()
+            self.thread_BtoA = None
 
-                else:
-                    self.show_error_popup(f"Error opening serial port: {e}")
+        # Close serials
+        if self.serial_A and self.serial_A.is_open:
+            self.serial_A.close()
+        if self.serial_B and self.serial_B.is_open:
+            self.serial_B.close()
+        self.serial_A = None
+        self.serial_B = None
 
-            except serial.SerialException as e:
-                self.connection_status_indicator.setStyleSheet("background-color: red; width: 20px; height: 20px;")
-                self.connection_status_indicator.setText("  Disconnected  ")
-                self.connect_button.setText("Connect")
+        # UI back to normal
+        self.status_label.setText("Disconnected")
+        self.status_label.setStyleSheet("background-color: red;")
+        self.connect_button.setText("Connect")
+        self.com_port_combo_A.setEnabled(True)
+        self.com_port_combo_B.setEnabled(True)
+        self.baud_rate_combo.setEnabled(True)
+        self.refresh_button.setEnabled(True)
 
-                self.com_port_combo.setEnabled(True)
-                self.baud_rate_combo.setEnabled(True)
+        # Refresh available ports (in case a device was unplugged/plugged)
+        self.refresh_com_ports()
 
-                self.show_error_popup(f"Error opening serial port:\n\n{e}\n")
-
-    @pyqtSlot(str)
-    def update_textbox(self, data):
-        self.textbox.insertPlainText(data)
-
-    @pyqtSlot(str,str)
-    def log_textbox(self, data, color):
+    # ---------- Logging & helpers ----------
+    def _log_text_internal(self, text, color="gray"):
         cursor = self.textbox.textCursor()
-
-        formt = QTextCharFormat()
-
-        formt.setForeground(QColor(color))
-        cursor.setCharFormat(formt)
-
-        cursor.insertText(data)
-
-        formt.setForeground(QColor("white"))
-        cursor.setCharFormat(formt)
-
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        # fmt.setFontWeight(QFont.Weight.Bold)
+        cursor.setCharFormat(fmt)
+        cursor.insertText(text)
         self.textbox.setTextCursor(cursor)
 
-    def show_error_popup(self, message):
-        error_dialog = QMessageBox(self)
-        error_dialog.setIcon(QMessageBox.Icon.Warning)
-        error_dialog.setWindowTitle("Error")
-        error_dialog.setText(message)
-        error_dialog.exec()
+    def log_text(self, text, color):
+        self._log_text_internal(text, color)
 
-    def select_script(self):
-        start_dir = ""
-        cached_dir = self.cache.get("last_script_dir")
-        if cached_dir and os.path.isdir(cached_dir):
-            start_dir = cached_dir
-
-        file_dialog = QFileDialog(self, directory=start_dir)
-        file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-
-        if file_dialog.exec():
-            selected_file = file_dialog.selectedFiles()[0]
-            if selected_file:
-                self.script_label.setText(selected_file)
-                self.selected_file = selected_file
-                self.cache.__setitem__('last_script_dir', os.path.dirname(selected_file))
-
-    def run_selected_script(self):
-        if self.selected_file:
-            self.script_thread = ScriptExecutionThread(self.serial_conn, self.selected_file)
-            self.script_thread.error_occurred.connect(self.show_error_popup)
-            self.script_thread.log_request.connect(self.log_textbox)
-            self.script_thread.start()
-        else:
-            self.show_error_popup("No script loaded.\nPlease select a script first.")
-
-
-    def send_manual_command(self):
-        command = self.command_input.text()
-        self.command_input.clear()
-        if command:
-            if (self.serial_conn and self.serial_conn.is_open):
-                # self.textbox.clear()
-                self.serial_conn.write(command.encode())
-
-                if not self.command_history or self.command_history[-1] != command:
-                    self.command_history.append(command)
-                self.history_index = len(self.command_history)
-                self.command_history_changes.clear()
-                self.command_history_changes[self.history_index] = ''
-                self.cache.__setitem__('command_history', (self.command_history,self.command_history_changes,self.history_index))
-            else:
-                self.show_error_popup("Serial port not open.")
-
-
-    def eventFilter(self, obj, event):
-        if obj == self.command_input and event.type() == event.Type.KeyPress:
-
-            if event.key() == Qt.Key.Key_Up:
-                if self.history_index > 0:
-                    self.command_history_changes[self.history_index] = self.command_input.text()
-                    self.history_index -= 1
-                    if self.history_index in self.command_history_changes:
-                        self.command_input.setText(self.command_history_changes[self.history_index])
-                    else:
-                        self.command_input.setText(self.command_history[self.history_index])
-                return True
-            
-            if event.key() == Qt.Key.Key_Down:
-                if self.history_index < len(self.command_history):
-                    self.command_history_changes[self.history_index] = self.command_input.text()
-                    self.history_index += 1
-                    self.command_input.setText(self.command_history_changes[self.history_index])
-                return True
-
-            if event.key() == Qt.Key.Key_Escape:
-                self.history_index = len(self.command_history)
-                self.command_input.clear()
-                self.command_history_changes.clear()
-                self.command_history_changes[self.history_index] = ''
-                return True
-
-
-        self.cache.__setitem__('command_history', (self.command_history,self.command_history_changes,self.history_index))
-        return super().eventFilter(obj, event)
+    def show_error(self, message):
+        QMessageBox.warning(self, "Error", message)
 
     def closeEvent(self, event):
-        if self.receive_thread:
-            self.receive_thread.stop()
-            self.receive_thread.wait()
-            self.receive_thread = None
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
+        self.disconnect_ports()
         event.accept()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = SerialMonitorApp()
+    window = SerialMiddlemanApp()
     window.show()
     sys.exit(app.exec())

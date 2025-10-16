@@ -16,7 +16,7 @@ cd .\build
 python -m PyInstaller main.py
 xcopy /E /I /H /Y  .\assets .\dist\assets
 xcopy /E /I /H /Y  .\assets .\dist\assets
-python -m PyInstaller --name TermiCOM --onefile --windowed --icon=.\icon.ico main.py
+python -m PyInstaller --name WolfWire --onefile --windowed --icon=.\icon.ico main.py
 
 cd ..
 
