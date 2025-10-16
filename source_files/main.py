@@ -10,12 +10,20 @@ import os
 from platformdirs import user_data_dir
 from datetime import datetime
 
-from PyQt6.QtGui import QTextCharFormat, QColor, QFont, QTextCursor, QTextDocument
+from PyQt6.QtGui import QTextCharFormat, QColor, QFont, QTextCursor, QTextDocument, QIcon
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QMutex
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QMenu,
     QPushButton, QTextEdit, QComboBox, QLabel, QMessageBox
 )
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS2
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
 
 # -------------------------------------------------
 # Serial forwarding worker with time/baud-aware buffering
@@ -252,7 +260,9 @@ class CTextEdit(QTextEdit):
 class SerialMiddlemanApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WolfWire - COM Port Middleman")
+        self.setWindowTitle("WolfWire - COM Port Sniffer")
+        self.setWindowIcon(QIcon(resource_path("assets\\icon.png")))
+
         self.CACHE_FILE = os.path.join(user_data_dir("WolfWire", "WolfWire"), "com_cache.json")
 
         self.serial_A = None
